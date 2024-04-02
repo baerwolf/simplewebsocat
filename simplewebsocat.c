@@ -923,7 +923,7 @@ int main(int argc, char **argv) {
         //parse application options
         while (1) {
             int option_index = 0;
-            i=getopt_long(argc, argv, "vhdu:a:p:kt:", long_options, &option_index);
+            i=getopt_long(argc, argv, "vhdu:a:p:k:t:", long_options, &option_index);
             if (i<0) break;
 
             switch (i) {
