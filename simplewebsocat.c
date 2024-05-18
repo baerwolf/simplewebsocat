@@ -1,5 +1,5 @@
 /* simplewebsocat.c
- * version 20240127Z1245SB
+ * version 20240518Z1040SB
  * 
  * an TCP-Server forwarding connections to websockets
  * (using libcurl)
@@ -14,8 +14,8 @@
  * cd /tmp/delme.${USER}/
  * git clone https://github.com/curl/curl
  * cd curl
- * git tag -v curl-8_5_0
- * git reset --hard curl-8_5_0
+ * git tag -v curl-8_7_1
+ * git reset --hard curl-8_7_1
  * #in case you want your own libssl, too: #export PKG_CONFIG_PATH="/tmp/delme.${USER}/libcurl/lib/pkgconfig:${PKG_CONFIG_PATH}"
  * ./buildconf 
  * ./configure --prefix="/tmp/delme.${USER}/libcurl/" --enable-websockets --enable-http-auth --with-openssl
@@ -27,7 +27,7 @@
  * by Stephan Bärwolf, Rudolstadt 2024
  */
 
-#define MYVERSION "20240127Z1245SB"
+#define MYVERSION "20240518Z1040SB"
 #define HANDLE_WSPING 0
 
 /* 
@@ -514,6 +514,7 @@ int clientConnectionThread(connectionslot_t *slot) {
                 fd_set in, out, err;
                 struct timeval timeout;
                 char from[BUFFER_SIZE], to[BUFFER_SIZE];
+                bool rragain = false;  /* remote read again */
 #if HANDLE_WSPING
                 char extra[BUFFER_SIZE];
                 ssize_t extraidx=0;
@@ -525,21 +526,29 @@ int clientConnectionThread(connectionslot_t *slot) {
                 fromiptr = fromoptr = from;
                 toiptr = tooptr = to;
                 while (!(_doExit)) {
-                    timeout.tv_sec=slot->appconfig->timout_sec; timeout.tv_usec=0;
+                    DBGOUT(DBGANNOUNCE, "------------begin loop------------\n");
                     FD_ZERO(&in); FD_ZERO(&out); FD_ZERO(&err);
                     
+                    //check local client ability to receive:
                     if (toiptr < &to[sizeof(to)]) {
+                        //there is space left within websocket-out buffer (local client can receive)
                         FD_SET(slot->fd, &in);
                         if (slot->fd > maxfd) maxfd=slot->fd;
-                        DBGOUT(DBGANNOUNCE, "thread %p: serversocket ready to receive (buffer %d bytes)\n", (void*)slot, (int)(toiptr-tooptr));
+                        DBGOUT(DBGANNOUNCE, "thread %p: serversocket ready to receive (buffer %d bytes free)\n", (void*)slot, (int)(((int)BUFFER_SIZE) - ((int)(toiptr-tooptr))));
                     }
+                    //////////////////////////////////////////////////////////
 
+                    //check websocket ability to receive:
                     if (fromiptr < &from[sizeof(from)]) {
+                         //there is space left within websocket-IN buffer (websocket still can receive)
                          FD_SET(remotefd, &in);
                          if (remotefd > maxfd) maxfd=remotefd;
-                         DBGOUT(DBGANNOUNCE, "thread %p: websocket ready to receive (buffer %d bytes)\n", (void*)slot, (int)(fromiptr-fromoptr));
+                         DBGOUT(DBGANNOUNCE, "thread %p: websocket ready to receive (buffer %d bytes free)\n", (void*)slot, (int)(((int)BUFFER_SIZE)-((int)(fromiptr-fromoptr))));
                     }
+                    //////////////////////////////////////////////////////////
 
+                    //////////////////////////////////////////////////////////
+                    //check websocket ability to send:
 #if HANDLE_WSPING
                     if ((toiptr != tooptr) || (extraidx > 0)) {
 #else
@@ -556,16 +565,45 @@ int clientConnectionThread(connectionslot_t *slot) {
                                 DBGOUT(DBGINFO, "thread %p: websocket schedules a ping (wsLastTx_msec=%d)\n", (void*)slot, wsLastTx_msec);
                             }
                     }
+                    //////////////////////////////////////////////////////////
 
+                    //check local client ability to send:
                     if (fromiptr != fromoptr) {
                         FD_SET(slot->fd, &out);
                         if (slot->fd > maxfd) maxfd=slot->fd;
                         DBGOUT(DBGANNOUNCE, "thread %p: serversocket ready to send\n", (void*)slot);
                     }
-                    
-                    i=select(maxfd+1, &in, &out, &err, &timeout);
-                    wsLastTx_msec+=(((unsigned int)slot->appconfig->timout_sec)*1000) - ((1000*timeout.tv_sec)+(timeout.tv_usec/1000));
-                    DBGOUT(DBGINFO, "thread %p: select returned %i\n", (void*)slot, i);
+                    //////////////////////////////////////////////////////////
+
+
+                    if ((rragain) && (FD_ISSET(remotefd, &in))) {
+                        //curl_ws_recv is non-blocking and might have some data in its cache, which will not alert select
+                        timeout.tv_sec=0; timeout.tv_usec=0;
+                        i=select(maxfd+1, &in, &out, &err, &timeout);
+                        i++;
+                        FD_SET(remotefd, &in);
+                    } else {
+                        timeout.tv_sec=slot->appconfig->timout_sec; timeout.tv_usec=0;
+                        i=select(maxfd+1, &in, &out, &err, &timeout);
+                        wsLastTx_msec+=(((unsigned int)slot->appconfig->timout_sec)*1000) - ((1000*timeout.tv_sec)+(timeout.tv_usec/1000));
+                    }
+
+#if (DEBUG >= DBGINFO)
+                    {
+                      char fderr[]="--", fdin[]="--", fdout[]="--";
+
+                      if (FD_ISSET(remotefd, &err)) fderr[0]='W';
+                      if (FD_ISSET(slot->fd, &err)) fderr[1]='S';
+
+                      if (FD_ISSET(remotefd, &in)) fdin[0]='W';
+                      if (FD_ISSET(slot->fd, &in)) fdin[1]='S';
+
+                      if (FD_ISSET(remotefd, &out)) fdout[0]='W';
+                      if (FD_ISSET(slot->fd, &out)) fdout[1]='S';
+
+                      DBGOUT(DBGINFO, "thread %p: select returned %i (in: [%s], out: [%s], err: [%s])\n", (void*)slot, i, fdin, fdout, fderr);
+                    }
+#endif
                     if (i > 0) {
                         //select ok
                          if (i>=0) if (FD_ISSET(slot->fd, &err)) i=recv(slot->fd, NULL, 0, 0);
@@ -597,9 +635,13 @@ int clientConnectionThread(connectionslot_t *slot) {
                              if (FD_ISSET(remotefd, &in)) {
                                  struct curl_ws_frame quirky_curl_fix;
                                  const struct curl_ws_frame *meta;
-                                 DBGOUT(DBGANNOUNCE+2, "lifesign\n");
+                                 DBGOUT(DBGANNOUNCE+2, "lifesign (old-rragain=%s)\n", rragain?"true":"false");
+
+                                 //Instead of blocking, the function returns CURLE_AGAIN. The correct behavior is then to wait for the socket to signal readability before calling this function again.
                                  ret=curl_ws_recv(curl, fromiptr, &from[sizeof(from)] - fromiptr, &len, &meta);
-                                 DBGOUT(DBGANNOUNCE+2, "lifesign (curl_ws_recv()=%d, meta=%p)\n", (int)ret, (void*)meta);
+                                 rragain=((ret!=CURLE_AGAIN) && (assigned(meta)||(len>0)||(!rragain)));
+
+                                 DBGOUT(DBGANNOUNCE+2, "lifesign (curl_ws_recv()=%d, meta=%p, len=%d, rragain=%s)\n", (int)ret, (void*)meta, (int)len, rragain?"true":"false");
                                  if ((ret == CURLE_OK) || (ret == CURLE_AGAIN)) {
                                      // CURL QUIRK
                                      if (!(assigned(meta))) {
@@ -761,6 +803,7 @@ int clientConnectionThread(connectionslot_t *slot) {
                     }
 
                     if (!_doExit) _doExit=atomic_load(&doExit);
+                    DBGOUT(DBGANNOUNCE+2, "-------------end loop-------------\n\n");
                 }
             } else DBGOUT(DBGERROR, "remote socket not slectable\n");
         } else DBGOUT(DBGERROR, "error: %s\n", curl_easy_strerror(ret));
@@ -899,6 +942,9 @@ void usage(FILE *stream, int argc, char **argv) {
             fprintf(stream, "%s is based on libcurl and needs quite a recent one (implementing websockets). Your currently used libcurl is: %s (%s)\n", basename(argv[0]), ver->version, wsssupport);
         }
     }
+#ifdef DEBUG
+    fprintf(stream, "\nThis binary is compiled with debugging at level %i\n", DEBUG);
+#endif
 
     fprintf(stream, "\n");
     fprintf(stream, "calling example: %s --dumpconfig --url wss://user:password@demo.matrixstorm.com/localhost:22 --timeout 17 --keepalive 30 --bindport 41022\n", basename(argv[0]));
